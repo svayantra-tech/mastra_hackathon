@@ -35,6 +35,16 @@ export function attachHandle(runId: string, handle: RegisteredRun['handle']): vo
   if (r) r.handle = handle;
 }
 
+/**
+ * Insert a fully-formed view into the registry — used to cache a projection
+ * rehydrated from durable Mastra storage after a process restart (serverless),
+ * so subsequent dashboard polls are served from memory. Never clobbers a live
+ * entry (which may already hold the resume handle).
+ */
+export function registerRunView(view: SentinelRunView): void {
+  if (!runs.has(view.runId)) runs.set(view.runId, { view });
+}
+
 export function getRun(runId: string): RegisteredRun | undefined {
   return runs.get(runId);
 }

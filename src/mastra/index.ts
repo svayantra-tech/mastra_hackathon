@@ -11,9 +11,9 @@ import { Mastra } from '@mastra/core';
 import { Observability, DefaultExporter } from '@mastra/observability';
 import { LibSQLStore } from '@mastra/libsql';
 import { sentinelWorkflow, APPROVAL_STEP_ID, type SentinelState } from './workflow';
-import type { FaultInput, SessionUser } from '@/lib/types';
+import type { FaultInput, SessionUser, SentinelRunView, RunStage } from '@/lib/types';
 import { newCorrelationId } from '@/lib/telemetry';
-import { createRunView, attachHandle, getRun, patchRun } from '@/lib/run-registry';
+import { createRunView, attachHandle, getRun, patchRun, registerRunView, listRuns } from '@/lib/run-registry';
 import { ensureSeeded } from '@/lib/memory';
 
 const g = globalThis as unknown as { __sentinelMastra?: Mastra };
@@ -22,7 +22,11 @@ export function getMastra(): Mastra {
   if (!g.__sentinelMastra) {
     g.__sentinelMastra = new Mastra({
       workflows: { sentinelWorkflow },
-      storage: new LibSQLStore({ id: 'sentinel-storage', url: process.env.MASTRA_DB_URL || 'file:./sentinel.db' }),
+      storage: new LibSQLStore({
+        id: 'sentinel-storage',
+        url: process.env.MASTRA_DB_URL || 'file:./sentinel.db',
+        authToken: process.env.MASTRA_DB_AUTH_TOKEN,
+      }),
       // Mastra 1.x observability registry — spans persisted to Mastra storage.
       // OTLP export to Jaeger is wired independently in src/instrumentation.ts
       // via the OpenTelemetry NodeSDK (see docs/OBSERVABILITY.md).
@@ -79,10 +83,7 @@ export async function resumeSentinelRun(
   runId: string,
   resumeData: { approved: boolean; technicianId: string; notes?: string },
 ): Promise<{ ok: boolean; error?: string }> {
-  const reg = getRun(runId);
-  if (!reg) return { ok: false, error: 'Unknown run' };
-
-  const doResume = async (handle: NonNullable<typeof reg.handle>) => {
+  const doResume = async (handle: { resume: (args: { step: string; resumeData: unknown }) => Promise<unknown> }) => {
     void handle
       .resume({ step: APPROVAL_STEP_ID, resumeData })
       .catch((err) => {
@@ -91,14 +92,30 @@ export async function resumeSentinelRun(
       });
   };
 
-  if (reg.handle) {
+  // Fast path: the live handle is still in memory (same process, incl. dev HMR).
+  const reg = getRun(runId);
+  if (reg?.handle) {
     await doResume(reg.handle);
     return { ok: true };
   }
 
-  // Handle lost (process restart) — recreate from persisted storage by runId.
+  // Slow path: the process restarted (the serverless failure mode). The in-memory
+  // registry/handle is gone, but the workflow snapshot is durable in Mastra storage
+  // (Turso in prod, local file in dev). Rehydrate by id, rebuild the UI projection
+  // from the persisted input, and resume. THIS is what durable storage exists for.
   try {
     const wf = getMastra().getWorkflow('sentinelWorkflow');
+    const persisted = await wf.getWorkflowRunById(runId);
+    if (!persisted) return { ok: false, error: 'Unknown run' };
+    if (persisted.status !== 'suspended') {
+      return { ok: false, error: `Run is ${persisted.status}, not resumable` };
+    }
+    // Rebuild the run-registry view if this process never saw it (post-restart),
+    // so the dashboards can render the run through resume → DONE.
+    if (!reg) {
+      const view = viewFromPersisted(runId, persisted);
+      if (view) registerRunView(view);
+    }
     const run = await wf.createRun({ runId });
     const handle = { resume: (args: { step: string; resumeData: unknown }) => run.resume(args as never) };
     attachHandle(runId, handle);
@@ -107,4 +124,99 @@ export async function resumeSentinelRun(
   } catch (err) {
     return { ok: false, error: `Could not rehydrate run: ${String(err)}` };
   }
+}
+
+// ── Read-path rehydration (serverless cold-process reads — FR-01..FR-12) ──────
+// The run-registry is an in-memory UI projection; on Vercel a dashboard poll can
+// hit a process that never ran the workflow, so the run is absent from memory.
+// These helpers rebuild the SentinelRunView from the durable Mastra snapshot so a
+// SUSPENDED run (the demo climax) renders instead of 404-ing.
+
+/** Map a persisted workflow status + accumulated state to a Sentinel run stage. */
+function stageFromPersisted(status: string, s: Partial<SentinelState>): RunStage {
+  if (status === 'suspended') return 'SUSPENDED';
+  if (status === 'success') return 'DONE';
+  if (status === 'failed' || status === 'canceled') return 'FAILED';
+  if (s.approval) return 'EXECUTING';
+  if (s.safety) return 'SAFETY_CHECKED';
+  if (s.scorecard) return 'SCORED';
+  if (s.runbook) return 'RUNBOOK_DRAFTED';
+  if (s.context) return 'CONTEXT_RETRIEVED';
+  return 'FAULT_INGESTED';
+}
+
+/**
+ * Each workflow step returns the whole accumulated State ({ ...s, … }); pick the
+ * richest one available (latest step wins) so the rebuilt view carries context,
+ * runbook, safety report and corrected runbook — not just the initial fault.
+ */
+function accumulatedState(persisted: { payload?: unknown; steps?: Record<string, unknown> }): Partial<SentinelState> {
+  const steps = (persisted.steps ?? {}) as Record<string, { payload?: unknown; output?: unknown }>;
+  const order = ['execute-and-close', 'technician-approval', 'safety-gate', 'draft-and-score', 'retrieve-context', 'ingest-fault'];
+  const hasFault = (v: unknown): v is Partial<SentinelState> => !!v && typeof v === 'object' && 'fault' in (v as object);
+  for (const id of order) {
+    const step = steps[id];
+    if (!step) continue;
+    if (hasFault(step.payload)) return step.payload; // input = state as of this step
+    if (hasFault(step.output)) return step.output;
+  }
+  return hasFault(persisted.payload) ? persisted.payload : {};
+}
+
+/** Rebuild a SentinelRunView from a persisted Mastra workflow snapshot (or null). */
+function viewFromPersisted(runId: string, persisted: { status: string; payload?: unknown; steps?: Record<string, unknown> }): SentinelRunView | null {
+  const s = accumulatedState(persisted);
+  if (!s.fault || !s.correlationId) return null;
+  const stage = stageFromPersisted(persisted.status, s);
+  const at = new Date().toISOString();
+  const timeline: SentinelRunView['timeline'] = [{ at, stage: 'FAULT_INGESTED', note: `Fault ${s.fault.faultCode} on ${s.fault.equipmentId} (rehydrated from durable storage)` }];
+  if (s.context) timeline.push({ at, stage: 'CONTEXT_RETRIEVED', note: 'Qdrant context (rehydrated)' });
+  if (s.runbook) timeline.push({ at, stage: 'RUNBOOK_DRAFTED', note: 'Runbook drafted (rehydrated)' });
+  if (s.scorecard) timeline.push({ at, stage: 'SCORED', note: 'Scored (rehydrated)' });
+  if (s.safety) {
+    const blocked = s.safety.violations.filter((v) => v.severity === 'block');
+    timeline.push({ at, stage: 'SAFETY_CHECKED', note: blocked.length ? `⛔ ${blocked.length} blocked: ${blocked.map((v) => v.type).join(', ')} (rehydrated)` : 'Safety gate clear (rehydrated)' });
+  }
+  if (stage === 'SUSPENDED') timeline.push({ at, stage: 'SUSPENDED', note: 'Rehydrated from persisted Mastra storage — durable across process restarts' });
+  return {
+    runId, correlationId: s.correlationId, fault: s.fault, stage,
+    workOrderId: s.workOrderId, context: s.context, runbook: s.runbook,
+    scorecard: s.scorecard, safety: s.safety, correctedRunbook: s.correctedRunbook,
+    approval: s.approval, timeline, startedAt: at,
+    finishedAt: stage === 'DONE' || stage === 'FAILED' ? at : undefined,
+  };
+}
+
+/** A single run's view — in-memory if present, else rehydrated from durable storage. */
+export async function getRunView(runId: string): Promise<SentinelRunView | null> {
+  const reg = getRun(runId);
+  if (reg) return reg.view;
+  try {
+    const wf = getMastra().getWorkflow('sentinelWorkflow');
+    const persisted = await wf.getWorkflowRunById(runId);
+    if (!persisted) return null;
+    const view = viewFromPersisted(runId, persisted);
+    if (view) registerRunView(view); // cache so later polls (and resume) hit memory
+    return view;
+  } catch {
+    return null;
+  }
+}
+
+/** All run views — in-memory ∪ persisted (in-memory wins), newest first. */
+export async function listRunViews(): Promise<SentinelRunView[]> {
+  const byId = new Map<string, SentinelRunView>(listRuns().map((v) => [v.runId, v]));
+  try {
+    const wf = getMastra().getWorkflow('sentinelWorkflow');
+    const { runs } = await wf.listWorkflowRuns();
+    for (const r of runs) {
+      if (byId.has(r.runId)) continue;
+      const persisted = await wf.getWorkflowRunById(r.runId).catch(() => null);
+      const view = persisted ? viewFromPersisted(r.runId, persisted) : null;
+      if (view) { byId.set(r.runId, view); registerRunView(view); }
+    }
+  } catch {
+    // durable storage unavailable — fall back to the in-memory projection only
+  }
+  return [...byId.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
 }
